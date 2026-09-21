@@ -556,6 +556,80 @@ class SnapshotProofResponse(BaseModel):
     )
 
 
+# ---------- 候选集原子注册 POST /namespaces/{namespace}/names/allocate ----------
+
+# 一次候选集原子注册请求的申请项数与每项候选名数上限
+MIN_ALLOCATE_ITEMS = 1
+MAX_ALLOCATE_ITEMS = 20
+MIN_ALLOCATE_CANDIDATES = 1
+MAX_ALLOCATE_CANDIDATES = 10
+
+# client_id 约束：1–64 字符、非空白（同一请求内还须互不相同）
+AllocateClientId = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=64),
+    AfterValidator(_not_blank),
+]
+
+
+class NameAllocateItem(BaseModel):
+    """候选集原子注册的单个申请项：唯一 client_id + 按优先级排列的 1–10 个候选名。"""
+
+    client_id: AllocateClientId = Field(
+        examples=["user-1"],
+        description="申请项的唯一标识，用于把分配结果与请求项一一对应；同一请求内必须互不相同",
+    )
+    candidates: list[NameStr] = Field(
+        min_length=MIN_ALLOCATE_CANDIDATES,
+        max_length=MAX_ALLOCATE_CANDIDATES,
+        examples=[["paypal", "paypal-app", "paypal-io"]],
+        description=(
+            "按优先级从高到低排列的候选显示名（1–10 个）；服务端在满足全部约束"
+            "的前提下，为各申请项选择候选序号向量字典序最小的互不冲突组合"
+        ),
+    )
+
+
+class NameAllocateRequest(BaseModel):
+    """候选集原子注册请求体：1–20 个申请项，client_id 互不相同。"""
+
+    items: list[NameAllocateItem] = Field(
+        min_length=MIN_ALLOCATE_ITEMS,
+        max_length=MAX_ALLOCATE_ITEMS,
+        description="待原子分配的申请项（1–20 个）；全部项都能取得互不冲突候选时才一次性注册",
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_client_ids(self) -> "NameAllocateRequest":
+        client_ids = [item.client_id for item in self.items]
+        if len(set(client_ids)) != len(client_ids):
+            raise ValueError("items 中的 client_id 必须互不相同")
+        return self
+
+
+class AllocatedNameItem(NameRecord):
+    """候选集原子注册成功的单项：落库记录 + 申请项标识与命中的候选序号。"""
+
+    index: int = Field(description="申请项在请求中的下标（从 0 开始）")
+    client_id: str = Field(description="该申请项携带的唯一 client_id")
+    candidate_index: int = Field(
+        description="实际注册的候选名在该项 candidates 中的下标（从 0 开始，按优先级排列）"
+    )
+
+
+class NameAllocateResponse(BaseModel):
+    """候选集原子注册成功响应：items 按原请求顺序返回，states_explored 为搜索状态数。"""
+
+    namespace: str
+    states_explored: int = Field(
+        description=(
+            "服务端在单个写锁事务内为寻找可行组合而遍历的搜索状态数；"
+            "该值超过 10000 时接口改为返回 413 且不写库"
+        )
+    )
+    items: list[AllocatedNameItem]
+
+
 class ErrorDetail(BaseModel):
     error: str
     message: str

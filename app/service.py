@@ -121,6 +121,23 @@ POST /namespaces/{namespace}/snapshot-proof）：
    SHA-256 构建 Merkle 树：叶 H(0x00||json)，父 H(0x01||left||right)，
    奇数层复制末节点。证明为自叶向上的兄弟哈希 + left/right 方向，只由
    排序后下标决定——相同快照下请求节点顺序变化不改变根与各自证明
+
+候选集原子注册（allocate_names，
+POST /namespaces/{namespace}/names/allocate）：
+1. 接收 1–20 个申请项（每项 client_id 请求内唯一，candidates 为 1–10 个
+   按优先级排列的候选名），在单个 BEGIN IMMEDIATE 写锁事务中惰性清理过期
+   预占与冷却、重新加载空间策略后，对每个候选做静态判定：混脚本
+   （mixed_script 阻断）或与库内已注册名称 / 有效预占 / 未过期冷却规范名
+   相同 / 同形（existing_conflict 阻断）的候选不可选
+2. 对不同申请项之间的候选两两判定（规范化结果去重后比较）：规范名相同 /
+   同形的两个候选不能同时入选
+3. 回溯 DFS 按申请项顺序、候选优先级顺序枚举（带前向校验剪枝），找到的
+   第一个解即各项候选序号向量的字典序最小解；搜索状态数超过
+   MAX_ALLOCATION_STATES（10000）即抛 AllocationSearchTooLargeError
+   （-> 413），放弃搜索且不写库
+4. 无解抛 AllocationImpossibleError（-> 409），items 列出全部申请项的逐
+   候选阻断原因（mixed_script / existing_conflict / request_conflict /
+   group_infeasible）；任何失败整体回滚，绝不写入部分结果
 """
 from __future__ import annotations
 
@@ -2094,4 +2111,346 @@ def build_snapshot_proof(
         "max_nodes": max_nodes,
         "policy": {key: value for key, value in policy_leaf.items() if key != "id"},
         "items": items,
+    }
+
+
+# ---------- 候选集原子注册（POST .../names/allocate） ----------
+
+# 组合搜索允许遍历的搜索状态上限：超过即抛 AllocationSearchTooLargeError（-> 413）
+MAX_ALLOCATION_STATES = 10000
+
+
+class AllocationImpossibleError(Exception):
+    """候选集原子注册不存在可行组合（HTTP 409 allocation_impossible）。
+
+    items 为每个申请项（全局 CSP 无解时即全部申请项）的逐候选阻断原因明细；
+    states_explored 为本次搜索实际遍历的搜索状态数。
+    """
+
+    def __init__(self, items: list[dict], states_explored: int):
+        super().__init__("allocation_impossible")
+        self.items = items
+        self.states_explored = states_explored
+
+
+class AllocationSearchTooLargeError(Exception):
+    """组合搜索遍历的搜索状态数超过 MAX_ALLOCATION_STATES（HTTP 413）。
+
+    states_explored 为超限时已经遍历的搜索状态数（> 上限）；limit 为上限。
+    超限后立即放弃搜索并整体回滚，不写入任何记录。
+    """
+
+    def __init__(self, states_explored: int, limit: int):
+        super().__init__("allocation_search_too_large")
+        self.states_explored = states_explored
+        self.limit = limit
+
+
+def _request_conflict_block(
+    item_index: int,
+    client_id: str,
+    candidate_index: int,
+    name: str,
+    normalized_name: str,
+    reason: str,
+) -> dict:
+    """请求内（申请项之间）候选冲突的阻断明细。"""
+    return {
+        "kind": "request_conflict",
+        "item_index": item_index,
+        "client_id": client_id,
+        "candidate_index": candidate_index,
+        "original_name": name,
+        "normalized_name": normalized_name,
+        "reason": reason,
+    }
+
+
+def _allocate_candidate_pair_conflicts(
+    prepared: list[list[dict]],
+) -> dict[tuple[int, int, int, int], str]:
+    """计算不同申请项候选之间的两两冲突，返回 ((i,a),(j,b)) -> reason 映射。
+
+    按规范名无序对去重调用 is_confusable（结果缓存），避免重复判定；
+    同一申请项内部的候选不参与（每项最终只选一个候选）。
+    """
+    pair_reasons: dict[tuple[int, int, int, int], str] = {}
+    # 规范名无序对 -> 是否同形（None 表示尚未判定，避免重复调用 is_confusable）
+    confusable_cache: dict[tuple[str, str], bool] = {}
+
+    def _norm_pair_reason(left_norm: str, right_norm: str) -> str | None:
+        if left_norm == right_norm:
+            return REASON_NORMALIZED_MATCH
+        key = tuple(sorted((left_norm, right_norm)))
+        confusable = confusable_cache.get(key)
+        if confusable is None:
+            confusable = is_confusable(left_norm, right_norm)
+            confusable_cache[key] = confusable
+        return REASON_CONFUSABLE if confusable else None
+
+    item_count = len(prepared)
+    for i in range(item_count):
+        for a, left in enumerate(prepared[i]):
+            for j in range(i + 1, item_count):
+                for b, right in enumerate(prepared[j]):
+                    reason = _norm_pair_reason(
+                        left["normalized_name"], right["normalized_name"]
+                    )
+                    if reason is not None:
+                        pair_reasons[(i, a, j, b)] = reason
+    return pair_reasons
+
+
+def _allocation_diagnostics(
+    items: list[dict],
+    prepared: list[list[dict]],
+    pair_reasons: dict[tuple[int, int, int, int], str],
+) -> list[dict]:
+    """CSP 无解时组装每个申请项的逐候选阻断原因明细。
+
+    全局无解时每个申请项都不存在可与其余项共同满足的候选，因此 items 列出
+    全部申请项。候选自带的静态阻断（混脚本 / 库内冲突）优先列出；仅静态可选
+    的候选再列出请求内与之冲突的其他申请项候选；既无静态阻断又无逐项冲突
+    （阻断来自多个申请项的相互牵制）时以 group_infeasible 说明。
+    """
+    item_count = len(items)
+    result: list[dict] = []
+    for i, item in enumerate(items):
+        candidates_detail: list[dict] = []
+        for a, entry in enumerate(prepared[i]):
+            blocks: list[dict] = list(entry["blocks"])
+            if entry["static_ok"]:
+                for j in range(item_count):
+                    if j == i:
+                        continue
+                    for b, other in enumerate(prepared[j]):
+                        if not other["static_ok"]:
+                            continue
+                        if i < j:
+                            reason = pair_reasons.get((i, a, j, b))
+                        else:
+                            reason = pair_reasons.get((j, b, i, a))
+                        if reason is not None:
+                            blocks.append(
+                                _request_conflict_block(
+                                    j,
+                                    items[j]["client_id"],
+                                    b,
+                                    other["original_name"],
+                                    other["normalized_name"],
+                                    reason,
+                                )
+                            )
+                if not blocks:
+                    # 候选本身合法，也不与任何单项候选直接冲突；不可行来自
+                    # 其余申请项之间的相互牵制（无全局可行组合）
+                    blocks.append(
+                        {
+                            "kind": "group_infeasible",
+                            "message": (
+                                "该候选本身合法，但其他申请项的候选相互牵制，"
+                                "不存在覆盖全部申请项的可行组合"
+                            ),
+                        }
+                    )
+            candidates_detail.append(
+                {
+                    "candidate_index": a,
+                    "original_name": entry["original_name"],
+                    "normalized_name": entry["normalized_name"],
+                    "blocks": blocks,
+                }
+            )
+        result.append(
+            {
+                "index": i,
+                "client_id": item["client_id"],
+                "candidates": candidates_detail,
+            }
+        )
+    return result
+
+
+def allocate_names(
+    conn: sqlite3.Connection,
+    namespace: str,
+    items: list[dict],
+) -> dict:
+    """候选集原子注册：单事务内为全部申请项寻找互不冲突组合并一次性注册。
+
+    items 为 [{"client_id": ..., "candidates": [name, ...]}]，候选名按优先级
+    排列。整个过程在**单个 BEGIN IMMEDIATE 写锁事务**中完成：
+
+    1. 持写锁后惰性清理过期预占与释放冷却，重新加载命名空间生效脚本策略；
+    2. 为每个候选做静态判定：混脚本（所属空间策略）或与库中已注册名称 /
+       有效预占 / 未过期冷却规范名相同 / 同形 -> 该候选静态不可选，记录阻断
+       原因；
+    3. 对不同申请项之间的候选两两判定（规范化结果去重后比较）：规范名相同 /
+       同形 -> 两个候选不能同时入选；
+    4. 回溯 DFS 按申请项顺序、候选优先级顺序寻找可行组合（带前向校验剪枝），
+       故找到的第一个解的候选序号向量即字典序最小解；遍历的搜索状态数超过
+       MAX_ALLOCATION_STATES 时抛 AllocationSearchTooLargeError（-> 413）；
+    5. 找到解后在同一事务一次性 INSERT 全部名称并提交；无解抛
+       AllocationImpossibleError（-> 409，附每个申请项的逐候选阻断原因）。
+
+    任何失败（409 / 413 / 锁竞争 / 唯一约束）都整体回滚，绝不写入部分结果。
+    """
+    item_count = len(items)
+
+    # 每个申请项的候选预处理结果，按请求下标排列：
+    # entry = {"original_name", "normalized_name", "blocks", "static_ok"}
+    prepared: list[list[dict]] = [[] for _ in range(item_count)]
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
+        pairs = get_blocked_pairs(conn, namespace)
+
+        # 1. 逐候选静态判定：混脚本（所属空间当前生效策略）+ 库内已注册名称 /
+        #    有效预占 / 未过期冷却的规范名相等 / 同形冲突
+        for i, item in enumerate(items):
+            for name in item["candidates"]:
+                normalized_name = normalize_name(name)
+                script_analysis = analyze_scripts(name, pairs)
+                blocks: list[dict] = []
+                if script_analysis["mixed_script_violation"]:
+                    blocks.append(
+                        {
+                            "kind": "mixed_script",
+                            "blocked_script_pairs": script_analysis[
+                                "blocked_script_pairs"
+                            ],
+                            "violating_script_pairs": script_analysis[
+                                "violating_script_pairs"
+                            ],
+                            "restricted_scripts_used": script_analysis[
+                                "restricted_scripts_used"
+                            ],
+                            "script_details": script_analysis["script_details"],
+                        }
+                    )
+                for conflict in find_conflicts(conn, namespace, normalized_name):
+                    blocks.append({"kind": "existing_conflict", **conflict})
+                prepared[i].append(
+                    {
+                        "original_name": name,
+                        "normalized_name": normalized_name,
+                        "blocks": blocks,
+                        "static_ok": not blocks,
+                    }
+                )
+
+        # 2. 申请项之间的候选两两冲突（仅静态判定需要在 Python 侧建模的部分）
+        pair_reasons = _allocate_candidate_pair_conflicts(prepared)
+
+        def conflicts_with_chosen(
+            item_index: int, candidate_index: int, chosen: list[int | None]
+        ) -> bool:
+            entry = prepared[item_index][candidate_index]
+            for other_index, other_choice in enumerate(chosen):
+                if other_index == item_index or other_choice is None:
+                    continue
+                if item_index < other_index:
+                    reason = pair_reasons.get(
+                        (item_index, candidate_index, other_index, other_choice)
+                    )
+                else:
+                    reason = pair_reasons.get(
+                        (other_index, other_choice, item_index, candidate_index)
+                    )
+                if reason is not None:
+                    return True
+            return False
+
+        def future_feasible(chosen: list[int | None], next_index: int) -> bool:
+            """前向校验：next_index 之后的每个申请项在当前已选组合下仍有候选。"""
+            for future_index in range(next_index, item_count):
+                has_option = False
+                for candidate_index in range(len(prepared[future_index])):
+                    entry = prepared[future_index][candidate_index]
+                    if not entry["static_ok"]:
+                        continue
+                    if not conflicts_with_chosen(future_index, candidate_index, chosen):
+                        has_option = True
+                        break
+                if not has_option:
+                    return False
+            return True
+
+        # 3. 回溯 DFS：按申请项顺序、候选优先级顺序枚举。每个“扩展一个申请项
+        #    的选择”计一个搜索状态；计数超限立即放弃（-> 413）。
+        states_explored = 0
+        chosen: list[int | None] = [None] * item_count
+
+        def search(index: int) -> list[int] | None:
+            nonlocal states_explored
+            for candidate_index, entry in enumerate(prepared[index]):
+                states_explored += 1
+                if states_explored > MAX_ALLOCATION_STATES:
+                    raise AllocationSearchTooLargeError(
+                        states_explored, MAX_ALLOCATION_STATES
+                    )
+                if not entry["static_ok"]:
+                    continue
+                chosen[index] = candidate_index
+                if conflicts_with_chosen(index, candidate_index, chosen):
+                    continue
+                # 前向校验剪枝：剩余申请项至少各有一个可选候选才继续深入；
+                # 剪枝不改变“第一个找到的解即字典序最小解”这一性质
+                if not future_feasible(chosen, index + 1):
+                    continue
+                if index + 1 == item_count:
+                    return list(chosen)
+                solution = search(index + 1)
+                if solution is not None:
+                    return solution
+            chosen[index] = None
+            return None
+
+        solution = search(0)
+
+        if solution is None:
+            diagnostics = _allocation_diagnostics(items, prepared, pair_reasons)
+            raise AllocationImpossibleError(diagnostics, states_explored)
+
+        # 4. 找到字典序最小解：同一事务一次性注册，任一失败整体回滚
+        inserted: list[int] = []
+        for i, candidate_index in enumerate(solution):
+            entry = prepared[i][candidate_index]
+            cursor = conn.execute(
+                """
+                INSERT INTO display_names (namespace, original_name, normalized_name)
+                VALUES (?, ?, ?)
+                """,
+                (namespace, entry["original_name"], entry["normalized_name"]),
+            )
+            inserted.append(cursor.lastrowid)
+        conn.commit()
+    except (AllocationImpossibleError, AllocationSearchTooLargeError):
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 唯一约束兜底 / 锁竞争：整体回滚，不写入任何记录
+        conn.rollback()
+        raise NameConflictError(str(exc)) from exc
+
+    placeholders = ", ".join("?" for _ in inserted)
+    rows = conn.execute(
+        f"SELECT * FROM display_names WHERE id IN ({placeholders}) ORDER BY id",
+        inserted,
+    ).fetchall()
+    records = {row["id"]: dict(row) for row in rows}
+    return {
+        "namespace": namespace,
+        "states_explored": states_explored,
+        "items": [
+            {
+                "index": i,
+                "client_id": items[i]["client_id"],
+                "candidate_index": candidate_index,
+                **records[inserted[i]],
+            }
+            for i, candidate_index in enumerate(solution)
+        ],
     }

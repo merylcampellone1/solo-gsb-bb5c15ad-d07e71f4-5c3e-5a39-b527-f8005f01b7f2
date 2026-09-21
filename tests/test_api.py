@@ -3668,6 +3668,530 @@ def test_openapi_documents_snapshot_proof_endpoint(client):
     assert "422" in operation["responses"]
 
 
+# ---------- 候选集原子注册 POST /namespaces/{namespace}/names/allocate ----------
+
+
+def allocate(client, items, namespace="chat"):
+    return client.post(
+        f"/namespaces/{namespace}/names/allocate", json={"items": items}
+    )
+
+
+def _alloc_item(client_id, *candidates):
+    return {"client_id": client_id, "candidates": list(candidates)}
+
+
+def test_allocate_success_registers_first_choices_for_all_items(client):
+    resp = allocate(
+        client,
+        [_alloc_item("a", "alice", "alice-2"), _alloc_item("b", "bob", "bob-2")],
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["namespace"] == "chat"
+    assert [item["client_id"] for item in body["items"]] == ["a", "b"]
+    assert [item["candidate_index"] for item in body["items"]] == [0, 0]
+    assert [item["original_name"] for item in body["items"]] == ["alice", "bob"]
+    # items 按请求顺序回显并带 index；落库记录 revision 初始为 1
+    assert [item["index"] for item in body["items"]] == [0, 1]
+    assert all(item["revision"] == 1 for item in body["items"])
+    # 全部一次性落库
+    names = client.get("/namespaces/chat/names").json()
+    assert {n["original_name"] for n in names} == {"alice", "bob"}
+
+
+def test_allocate_falls_back_to_lower_priority_candidate_when_first_blocked(client):
+    assert register(client, "alice").status_code == 201
+
+    # 首个候选与已注册名称规范名相同 -> 回退到第二个候选
+    resp = allocate(client, [_alloc_item("a", "ALICE", "zoe")])
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["items"][0]
+    assert item["candidate_index"] == 1
+    assert item["original_name"] == "zoe"
+    assert [n["original_name"] for n in client.get("/namespaces/chat/names").json()] == [
+        "alice",
+        "zoe",
+    ]
+
+
+def test_allocate_confusable_existing_name_blocks_candidate(client):
+    assert register(client, "app").status_code == 201
+    # 纯西里尔 арр 与拉丁 app 同形：第 0 候选被同形冲突挡住，回退第 1 候选
+    resp = allocate(client, [_alloc_item("a", CYRILLIC_APP, "zulu")])
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["items"][0]["candidate_index"] == 1
+
+
+def test_allocate_picks_lexicographically_smallest_candidate_index_vector(client):
+    # 两项候选集合相同：第 0 候选互相冲突，字典序最小解为 (0, 1) 而非 (1, 0)
+    resp = allocate(
+        client,
+        [
+            _alloc_item("a", "mike", "nina"),
+            _alloc_item("b", "mike", "nina"),
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    assert [item["candidate_index"] for item in resp.json()["items"]] == [0, 1]
+    assert [item["original_name"] for item in resp.json()["items"]] == ["mike", "nina"]
+
+    # 三候选两申请项：优先满足靠前的申请项
+    resp = allocate(
+        client,
+        [
+            _alloc_item("p", "x1", "x2", "x3"),
+            _alloc_item("q", "x1", "x2", "x3"),
+        ],
+        namespace="ns2",
+    )
+    assert resp.status_code == 201
+    assert [item["candidate_index"] for item in resp.json()["items"]] == [0, 1]
+
+
+def test_allocate_request_conflict_normalized_match_across_items(client):
+    # 两项都只有同一个规范名（大小写不同）且库中无占用 -> 无可行组合
+    resp = allocate(client, [_alloc_item("a", "oscar"), _alloc_item("b", "OSCAR")])
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "allocation_impossible"
+    assert len(detail["items"]) == 2
+    blocks = detail["items"][0]["candidates"][0]["blocks"]
+    assert blocks[0]["kind"] == "request_conflict"
+    assert blocks[0]["item_index"] == 1
+    assert blocks[0]["client_id"] == "b"
+    assert blocks[0]["candidate_index"] == 0
+    assert blocks[0]["reason"] == "normalized_match"
+    # 未写入任何记录
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_allocate_request_conflict_confusable_across_items(client):
+    resp = allocate(client, [_alloc_item("a", "app"), _alloc_item("b", CYRILLIC_APP)])
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["items"][0]["candidates"][0]["blocks"][0]["kind"] == "request_conflict"
+    assert detail["items"][0]["candidates"][0]["blocks"][0]["reason"] == "confusable"
+
+
+def test_allocate_409_lists_every_item_with_per_candidate_existing_conflicts(client):
+    assert register(client, "alice").status_code == 201
+
+    # 两项的唯一候选都与已注册的 alice 规范名相同
+    resp = allocate(
+        client, [_alloc_item("a1", "ALICE"), _alloc_item("a2", "Alice")]
+    )
+    assert resp.status_code == 409
+    items = resp.json()["detail"]["items"]
+    assert [item["index"] for item in items] == [0, 1]
+    assert [item["client_id"] for item in items] == ["a1", "a2"]
+    for item in items:
+        blocks = item["candidates"][0]["blocks"]
+        assert blocks[0]["kind"] == "existing_conflict"
+        assert blocks[0]["source"] == "registered"
+        assert blocks[0]["reason"] == "normalized_match"
+        assert blocks[0]["original_name"] == "alice"
+    # 无部分写入（仍只有最初的 alice）
+    assert [n["original_name"] for n in client.get("/namespaces/chat/names").json()] == [
+        "alice"
+    ]
+
+
+def test_allocate_409_group_infeasible_reports_request_conflicts_for_every_item(client):
+    # 3 个申请项竞争 2 个候选名：无全局解；每个候选都给出与其他申请项候选的冲突
+    resp = allocate(
+        client,
+        [
+            _alloc_item("a", "aa", "bb"),
+            _alloc_item("b", "aa", "bb"),
+            _alloc_item("c", "aa", "bb"),
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert len(detail["items"]) == 3
+    first_blocks = detail["items"][0]["candidates"][0]["blocks"]
+    assert {b["kind"] for b in first_blocks} == {"request_conflict"}
+    assert {b["item_index"] for b in first_blocks} == {1, 2}
+    # 第二项的冲突对手是 0 和 2
+    assert {
+        b["item_index"]
+        for b in detail["items"][1]["candidates"][0]["blocks"]
+    } == {0, 2}
+
+
+def test_allocate_mixed_script_candidate_skipped_and_registered_when_alternative_exists(
+    client,
+):
+    resp = allocate(client, [_alloc_item("a", MIXED_ADMIN, "henry")])
+    assert resp.status_code == 201
+    assert resp.json()["items"][0]["candidate_index"] == 1
+    assert [n["original_name"] for n in client.get("/namespaces/chat/names").json()] == [
+        "henry"
+    ]
+
+
+def test_allocate_mixed_script_only_candidate_returns_409_with_script_detail(client):
+    resp = allocate(client, [_alloc_item("a", MIXED_ADMIN)])
+    assert resp.status_code == 409
+    block = resp.json()["detail"]["items"][0]["candidates"][0]["blocks"][0]
+    assert block["kind"] == "mixed_script"
+    assert block["violating_script_pairs"] == [["Cyrillic", "Latin"]]
+    assert "script_details" in block
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_allocate_respects_namespace_script_policy(client):
+    assert (
+        client.put(
+            "/namespaces/ns/script-policy",
+            json={"blocked_script_pairs": [["Han", "Latin"]], "expected_revision": 0},
+        ).status_code
+        == 200
+    )
+    # "世界x"（Han+Latin）在该空间违规 -> 回退纯拉丁候选
+    resp = allocate(client, [_alloc_item("a", "世界x", "plain")], namespace="ns")
+    assert resp.status_code == 201
+    assert resp.json()["items"][0]["candidate_index"] == 1
+    block_resp = allocate(client, [_alloc_item("b", "世界x")], namespace="ns")
+    assert block_resp.status_code == 409
+    assert (
+        block_resp.json()["detail"]["items"][0]["candidates"][0]["blocks"][0]["kind"]
+        == "mixed_script"
+    )
+
+
+def test_allocate_active_reservation_blocks_candidate(client):
+    assert (
+        client.post(
+            "/namespaces/chat/reservations",
+            json={"name": "reserved-x", "ttl_seconds": 120},
+        ).status_code
+        == 201
+    )
+    resp = allocate(client, [_alloc_item("a", "RESERVED-X", "alt-y")])
+    assert resp.status_code == 201
+    assert resp.json()["items"][0]["candidate_index"] == 1
+
+    impossible = allocate(client, [_alloc_item("b", "RESERVED-X")])
+    assert impossible.status_code == 409
+    block = impossible.json()["detail"]["items"][0]["candidates"][0]["blocks"][0]
+    assert block["kind"] == "existing_conflict"
+    assert block["source"] == "reservation"
+    assert "expires_at" in block
+
+
+def test_allocate_active_cooldown_blocks_candidate(client):
+    record = register(client, "coolname").json()
+    deleted = client.request(
+        "DELETE",
+        f"/namespaces/chat/names/{record['id']}",
+        json={"expected_revision": 1, "cooldown_seconds": 3600},
+    )
+    assert deleted.status_code == 200
+
+    resp = allocate(client, [_alloc_item("a", "COOLNAME", "other-z")])
+    assert resp.status_code == 201
+    assert resp.json()["items"][0]["candidate_index"] == 1
+
+    impossible = allocate(client, [_alloc_item("b", "COOLNAME")])
+    assert impossible.status_code == 409
+    block = impossible.json()["detail"]["items"][0]["candidates"][0]["blocks"][0]
+    assert block["kind"] == "existing_conflict"
+    assert block["source"] == "released"
+    assert "expires_at" in block
+
+
+def test_allocate_purges_expired_reservations_and_cooldowns_in_write_transaction(client):
+    client.post(
+        "/namespaces/ns/reservations", json={"name": "tempres", "ttl_seconds": 30}
+    )
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE name_reservations SET expires_at = '2000-01-01T00:00:00.000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = allocate(client, [_alloc_item("a", "TEMPRES")], namespace="ns")
+    assert resp.status_code == 201
+    conn = database.get_connection()
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM name_reservations").fetchone()[0] == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_allocate_413_when_search_exceeds_10000_states_and_writes_nothing(client):
+    # 11 个申请项竞争 10 个互不冲突的候选名（任意两两规范化均不同），无解；
+    # 回溯搜索状态数很快超过 10000
+    items = [
+        _alloc_item(f"c{i}", *[f"name{j}" for j in range(10)]) for i in range(11)
+    ]
+    resp = allocate(client, items)
+    assert resp.status_code == 413, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "allocation_search_too_large"
+    assert detail["states_explored"] > 10000
+    assert detail["limit"] == 10000
+    # 放弃搜索、不写任何记录
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_allocate_413_takes_precedence_and_keeps_existing_data(client):
+    assert register(client, "keeper").status_code == 201
+    items = [
+        _alloc_item(f"c{i}", *[f"name{j}" for j in range(10)]) for i in range(11)
+    ]
+    resp = allocate(client, items)
+    assert resp.status_code == 413
+    names = [n["original_name"] for n in client.get("/namespaces/chat/names").json()]
+    assert names == ["keeper"]
+
+
+def test_allocate_solution_below_limit_still_succeeds_at_boundary(client):
+    # 10 个申请项竞争 10 个候选名：恰好可行（分配 0..9），状态数远低于上限
+    items = [
+        _alloc_item(f"c{i}", *[f"slot{j}" for j in range(10)]) for i in range(10)
+    ]
+    resp = allocate(client, items)
+    assert resp.status_code == 201, resp.text
+    assert [item["candidate_index"] for item in resp.json()["items"]] == list(range(10))
+
+
+def test_allocate_states_explored_counts_partial_assignments(client):
+    resp = allocate(
+        client, [_alloc_item("a", "u1"), _alloc_item("b", "u2"), _alloc_item("c", "u3")]
+    )
+    # 每个申请项扩展一次选择即一个搜索状态：3 项一次走通 = 3
+    assert resp.json()["states_explored"] == 3
+
+
+def test_allocate_request_validation(client):
+    # 空 items -> 422
+    assert allocate(client, []).status_code == 422
+    # 21 个申请项 -> 422
+    too_many = [_alloc_item(f"c{i}", "x") for i in range(21)]
+    assert allocate(client, too_many).status_code == 422
+    # client_id 重复 -> 422
+    assert allocate(
+        client, [_alloc_item("dup", "a"), _alloc_item("dup", "b")]
+    ).status_code == 422
+    # 候选为空 / 11 个候选 -> 422
+    assert allocate(client, [{"client_id": "a", "candidates": []}]).status_code == 422
+    assert allocate(
+        client, [{"client_id": "a", "candidates": [f"c{i}" for i in range(11)]}]
+    ).status_code == 422
+    # client_id 空白 / 候选名空白 / 超长 -> 422
+    assert allocate(client, [_alloc_item("   ", "x")]).status_code == 422
+    assert allocate(client, [_alloc_item("a", "   ")]).status_code == 422
+    # 缺字段 -> 422
+    assert client.post(
+        "/namespaces/chat/names/allocate", json={"items": [{"client_id": "a"}]}
+    ).status_code == 422
+    assert client.post(
+        "/namespaces/chat/names/allocate",
+        json={"items": [{"candidates": ["x"]}]},
+    ).status_code == 422
+
+
+def test_allocate_single_item_behaves_like_register(client):
+    resp = allocate(client, [_alloc_item("solo", "soloname")])
+    assert resp.status_code == 201
+    item = resp.json()["items"][0]
+    assert item["revision"] == 1
+    assert item["normalized_name"] == "soloname"
+    assert item["client_id"] == "solo"
+
+
+def test_allocate_namespace_isolation(client):
+    assert register(client, "shared", namespace="a").status_code == 201
+    # 其他命名空间不受影响：同名可在 b 空间分配
+    resp = allocate(client, [_alloc_item("a", "shared")], namespace="b")
+    assert resp.status_code == 201
+
+
+def test_allocate_duplicate_candidates_within_item_allowed(client):
+    resp = allocate(client, [_alloc_item("dup", "samename", "samename", "othername")])
+    assert resp.status_code == 201
+    assert resp.json()["items"][0]["candidate_index"] == 0
+
+
+def test_allocate_409_writes_no_partial_results(client):
+    # 第 1 项可注册，第 2 项无候选：整体 409，第 1 项也不得落库
+    resp = allocate(
+        client,
+        [
+            _alloc_item("ok", "fine-name"),
+            _alloc_item("blocked", MIXED_ADMIN),
+        ],
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    # 两项都被列出；可注册项的唯一候选与混脚本项不冲突，但全局无解
+    assert {item["client_id"] for item in detail["items"]} == {"ok", "blocked"}
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_allocate_failed_request_writes_nothing_and_successful_one_purges(client):
+    # 预置一条过期冷却：失败的 allocate 整体回滚（含惰性清理 DELETE），
+    # 不写入任何新名称；随后成功的 allocate 提交时才真正物理清理过期记录。
+    record = register(client, "gone", namespace="ns").json()
+    client.request(
+        "DELETE",
+        f"/namespaces/ns/names/{record['id']}",
+        json={"expected_revision": 1, "cooldown_seconds": 3600},
+    )
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE name_cooldowns SET expires_at = '2000-01-01T00:00:00.000Z' "
+            "WHERE namespace = 'ns'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = allocate(client, [_alloc_item("a", MIXED_ADMIN)], namespace="ns")
+    assert resp.status_code == 409
+    conn = database.get_connection()
+    try:
+        # 失败整体回滚：无新名称；惰性清理随事务一起回滚（与批量 / 预占等
+        # 写事务失败时行为一致），过期冷却行仍在（但不影响判定）
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM display_names WHERE namespace = 'ns'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM name_cooldowns WHERE namespace = 'ns'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        conn.close()
+
+    # 成功的 allocate 提交时惰性清理过期冷却
+    ok = allocate(client, [_alloc_item("b", "fresh-name")], namespace="ns")
+    assert ok.status_code == 201
+    conn = database.get_connection()
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM name_cooldowns WHERE namespace = 'ns'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_service_allocate_runs_in_single_immediate_transaction(client, monkeypatch):
+    """服务层：allocate_names 全程使用单个 BEGIN IMMEDIATE 事务。
+
+    成功与失败路径都不得在事务外写入；409 / 413 时连接回到无活动事务状态。
+    sqlite3.Connection 为内置不可变类型、实例属性也只读，故用代理连接包装
+    单个真实连接并统计 BEGIN IMMEDIATE 次数（service 只通过传入的 conn 访问）。
+    """
+
+    class CountingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+            self.begin_count = 0
+
+        def execute(self, sql, *args, **kwargs):
+            if sql == "BEGIN IMMEDIATE":
+                self.begin_count += 1
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    real_conn = database.get_connection()
+    conn = CountingConnection(real_conn)
+    try:
+        # 成功路径：恰好一个 BEGIN IMMEDIATE
+        result = service.allocate_names(
+            conn, "chat", [{"client_id": "a", "candidates": ["one", "two"]}]
+        )
+        assert result["items"][0]["candidate_index"] == 0
+        assert conn.begin_count == 1
+        assert real_conn.in_transaction is False
+
+        # 无解路径：同样一个 BEGIN IMMEDIATE，结束已回滚、无残留事务
+        with pytest.raises(service.AllocationImpossibleError):
+            service.allocate_names(
+                conn,
+                "chat",
+                [
+                    {"client_id": "x", "candidates": ["one"]},
+                    {"client_id": "y", "candidates": ["ONE"]},
+                ],
+            )
+        assert conn.begin_count == 2
+        assert real_conn.in_transaction is False
+
+        # 搜索超限路径：再一个 BEGIN IMMEDIATE，回滚且不写入
+        oversized = [
+            {"client_id": f"c{i}", "candidates": [f"n{j}" for j in range(10)]}
+            for i in range(11)
+        ]
+        with pytest.raises(service.AllocationSearchTooLargeError):
+            service.allocate_names(conn, "chat", oversized)
+        assert conn.begin_count == 3
+        assert real_conn.in_transaction is False
+
+        # 只有成功路径的 "one" 落库
+        rows = service.list_names(real_conn, "chat")
+        assert [r["original_name"] for r in rows] == ["one"]
+    finally:
+        real_conn.close()
+
+
+def test_allocate_concurrent_requests_serialize_without_5xx(client):
+    """两个并发 allocate 在写锁下串行：至多一次抢得冲突候选，整体无 5xx。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def call(seq):
+        return allocate(
+            client,
+            [
+                _alloc_item(f"c{seq}-0", "contested", f"alt-{seq}-0"),
+                _alloc_item(f"c{seq}-1", f"other-{seq}", f"alt-{seq}-1"),
+            ],
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(call, range(2)))
+    assert all(resp.status_code in (201, 409) for resp in responses), responses
+    # "contested" 至多被注册一次
+    contested = [
+        n
+        for n in client.get("/namespaces/chat/names").json()
+        if n["normalized_name"] == "contested"
+    ]
+    assert len(contested) == 1
+    # 两个请求都成功时必须注册了 4 条互不冲突的名称
+    assert all(resp.status_code == 201 for resp in responses)
+    assert len(client.get("/namespaces/chat/names").json()) == 4
+
+
+def test_openapi_documents_allocate_endpoint(client):
+    operation = client.get("/openapi.json").json()["paths"][
+        "/namespaces/{namespace}/names/allocate"
+    ]["post"]
+    assert "201" in operation["responses"]
+    assert "409" in operation["responses"]
+    assert "413" in operation["responses"]
+    assert "422" in operation["responses"]
+
+
 # ---------- 版本化迁移（schema_migrations） ----------
 
 

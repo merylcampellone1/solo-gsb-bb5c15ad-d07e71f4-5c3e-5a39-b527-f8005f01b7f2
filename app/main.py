@@ -3,6 +3,7 @@
 接口一览：
 - POST   /namespaces/{namespace}/names                              注册显示名（201 / 409 / 422）
 - POST   /namespaces/{namespace}/names/batch                        批量注册（201 / 409 / 422，单事务）
+- POST   /namespaces/{namespace}/names/allocate                     候选集原子注册（201 / 409 / 413 / 422，单事务）
 - POST   /namespaces/{namespace}/names/swap                         原子交换两条已注册名称（200 / 404 / 409 / 422，单事务）
 - PATCH  /namespaces/{namespace}/names/{id}                         原子改名（200 / 404 / 409 / 422，单事务）
 - DELETE /namespaces/{namespace}/names/{id}                         删除名称并进入释放冷却（200 / 404 / 409 / 422，单事务）
@@ -36,6 +37,8 @@ from .schemas import (
     CooldownRecord,
     MergeRequest,
     MergeResult,
+    NameAllocateRequest,
+    NameAllocateResponse,
     NameRecord,
     NameRequest,
     NameRiskClustersRequest,
@@ -62,7 +65,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
@@ -85,7 +88,13 @@ app = FastAPI(
         "（POST /namespaces/{namespace}/snapshot-proof）：在单个 SQLite 读事务"
         "快照上固定生效脚本策略、已注册名称、有效预占与未过期冷却，按类型与 id "
         "排序后以规范 JSON + SHA-256 构建 Merkle 树（叶 0x00、父 0x01、奇数层"
-        "复制末节点），为 1–20 个请求节点返回带左右方向的包含证明。"
+        "复制末节点），为 1–20 个请求节点返回带左右方向的包含证明；"
+        "支持候选集原子注册（POST /namespaces/{namespace}/names/allocate）："
+        "在单个 BEGIN IMMEDIATE 写锁事务中为 1–20 个申请项（每项唯一 "
+        "client_id 与按优先级排列的 1–10 个候选名）以脚本策略、规范名、同形、"
+        "有效预占与释放冷却为约束寻找互不冲突组合，存在多组解时取候选序号"
+        "向量字典序最小解并一次性注册，无可行组合返回 409 allocation_impossible"
+        "（附逐候选阻断原因、不写部分结果），搜索状态超过 10000 返回 413 且不写库。"
     ),
     lifespan=lifespan,
 )
@@ -562,6 +571,85 @@ def register_names_batch(
             {"index": index, **record} for index, record in enumerate(records)
         ],
     }
+
+
+@app.post(
+    "/namespaces/{namespace}/names/allocate",
+    status_code=status.HTTP_201_CREATED,
+    response_model=NameAllocateResponse,
+    responses={
+        409: {
+            "description":
+                "不存在覆盖全部申请项的互不冲突组合：allocation_impossible，"
+                "附每个申请项的逐候选阻断原因，不写入任何记录"
+        },
+        413: {"description": "组合搜索状态数超过 10000：allocation_search_too_large，不写库"},
+        422: {"description": "items 数量不在 1–20、client_id 重复，或某项候选名不在 1–10 个 / 不合法"},
+    },
+)
+def allocate_names(namespace: str, payload: NameAllocateRequest, conn=Depends(get_db)) -> dict:
+    """候选集原子注册：单事务内为全部申请项寻找互不冲突组合并一次性注册。
+
+    接收 1–20 个申请项，每项含唯一 `client_id` 与按优先级排列的 1–10 个
+    候选名。整个分配在**单个 BEGIN IMMEDIATE 写锁事务**中完成：先惰性清理
+    过期预占与释放冷却，再以所属命名空间的**生效脚本策略**、**规范名查重**、
+    **同形字符判定**、**有效预占**与**未过期释放冷却**为约束，为全部申请项
+    寻找一组互不冲突的候选（申请项之间的候选也不得规范名相同 / 同形）。
+
+    回溯搜索按申请项顺序、候选优先级顺序枚举，因此存在多组解时，返回的
+    始终是**各项候选序号向量字典序最小**的那一组，并在同一事务一次性注册；
+    搜索遍历状态数超过 **10000** 时直接返回 `413 allocation_search_too_large`
+    （附 states_explored / limit），放弃搜索且**不写库**。
+
+    任一申请项在当前库状态与其余申请项的共同约束下没有可行候选时返回
+    `409 allocation_impossible`：`items` 列出全部申请项，每项逐候选给出
+    阻断原因（`mixed_script` 混脚本明细；`existing_conflict` 库中已注册名称 /
+    有效预占 / 未过期冷却的规范名 / 同形冲突；`request_conflict` 请求内与
+    其他申请项候选的冲突；`group_infeasible` 候选本身合法但其余申请项相互
+    牵制导致无全局解），同样**不写入任何部分结果**。
+    """
+    items = [
+        {"client_id": item.client_id, "candidates": item.candidates}
+        for item in payload.items
+    ]
+    try:
+        return service.allocate_names(conn, namespace, items)
+    except service.AllocationImpossibleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "allocation_impossible",
+                "message": (
+                    "不存在覆盖全部申请项的互不冲突候选组合；以下逐项给出各候选"
+                    "的阻断原因，本次请求未写入任何记录"
+                ),
+                "states_explored": exc.states_explored,
+                "items": exc.items,
+            },
+        )
+    except service.AllocationSearchTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,  # 413 Payload Too Large（新旧 starlette 常量名不同，直接用字面值）
+            detail={
+                "error": "allocation_search_too_large",
+                "message": (
+                    f"为全部申请项寻找互不冲突组合的搜索已遍历 {exc.states_explored} "
+                    f"个状态，超过上限 {exc.limit}；已放弃搜索并回滚，未写入任何记录，"
+                    "请减少申请项 / 候选数量或放宽候选后重试"
+                ),
+                "states_explored": exc.states_explored,
+                "limit": exc.limit,
+            },
+        )
+    except service.NameConflictError:
+        # 锁竞争 / 唯一约束兜底：事务已整体回滚（无部分写入），客户端可重试
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "allocation_conflict",
+                "message": "分配注册时发生并发竞争，事务已整体回滚（无部分更新），请重试",
+            },
+        )
 
 
 @app.post(
