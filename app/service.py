@@ -121,6 +121,22 @@ POST /namespaces/{namespace}/snapshot-proof）：
    SHA-256 构建 Merkle 树：叶 H(0x00||json)，父 H(0x01||left||right)，
    奇数层复制末节点。证明为自叶向上的兄弟哈希 + left/right 方向，只由
    排序后下标决定——相同快照下请求节点顺序变化不改变根与各自证明
+
+候选集原子注册（allocate_names，
+POST /namespaces/{namespace}/names/allocate）：
+1. 接收 1–20 个申请项（client_id 请求内唯一，各带 1–10 个按优先级排列
+   的候选名），全部工作在单个 BEGIN IMMEDIATE 写锁事务内：先惰性清理
+   过期预占与冷却，再重新加载命名空间生效脚本策略、一次性读取全部既有
+   占用（已注册名称 + 有效预占 + 未过期冷却）
+2. 对每个候选做与单条注册一致的静态判定（混脚本 / 规范名 / 同形；同形
+   判定按无序规范名对在请求内缓存），不通过只标记该候选不可选并记录
+   逐候选原因；再以 app.allocation.AllocationModel 预计算项间冲突位掩码
+   （不同项选中候选规范名相等 / 同形即冲突）
+3. 回溯搜索字典序最小的完整分配（候选按序号升序试探 + 前向检查剪枝）；
+   搜索状态超过 10000 抛 AllocationSearchTooLargeError（-> 413），无解
+   抛 AllocationImpossibleError（-> 409，附无可选项及逐候选静态原因与
+   项间冲突），两者均回滚不写库；有解才在同一事务一次性 INSERT 全部
+   名称并按请求顺序返回记录（附 client_id / 中选 candidate_index）
 """
 from __future__ import annotations
 
@@ -131,6 +147,12 @@ from datetime import datetime, timedelta, timezone
 
 from confusables import is_confusable
 
+from .allocation import (
+    MAX_CANDIDATES_PER_ITEM,
+    AllocationModel,
+    AllocationSearchTooLargeError,
+    CandidateSpec,
+)
 from .analysis import (
     DEFAULT_BLOCKED_PAIRS,
     analyze_scripts,
@@ -327,6 +349,20 @@ class SnapshotNodesNotFoundError(Exception):
     def __init__(self, missing: list[dict]):
         super().__init__("snapshot_nodes_not_found")
         self.missing = missing
+
+
+class AllocationImpossibleError(Exception):
+    """候选集原子注册不存在可行组合（HTTP 409 allocation_impossible）。
+
+    items 为“无可选项”的申请项明细（按请求索引升序），每项给出 client_id 与
+    逐候选阻断原因；searched_states 为搜索访问的状态数。该异常只在写锁事务
+    回滚后由接口层读取，数据库未发生任何写入。
+    """
+
+    def __init__(self, items: list[dict], searched_states: int):
+        super().__init__("allocation_impossible")
+        self.items = items
+        self.searched_states = searched_states
 
 
 def utc_now() -> datetime:
@@ -2095,3 +2131,367 @@ def build_snapshot_proof(
         "policy": {key: value for key, value in policy_leaf.items() if key != "id"},
         "items": items,
     }
+
+
+# ---------- 候选集原子注册（POST .../names/allocate） ----------
+
+
+def _existing_occupants(conn: sqlite3.Connection, namespace: str, now: datetime) -> list[dict]:
+    """一次性读取命名空间内参与候选判定的全部既有占用（已注册 + 有效预占 +
+    未过期冷却），供候选集分配的逐项逐候选静态判定复用，避免每个候选重复查询。
+
+    顺序与 find_conflicts 一致：已注册名称（id 升序）-> 有效预占（id 升序）
+    -> 未过期冷却（id 升序）。
+    """
+    occupants: list[dict] = []
+    for row in conn.execute(
+        """
+        SELECT id, original_name, normalized_name
+        FROM display_names
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall():
+        occupants.append({**dict(row), "source": SOURCE_REGISTERED})
+    for row in _active_reservation_rows(conn, namespace, now):
+        occupants.append({**dict(row), "source": SOURCE_RESERVATION})
+    for row in _active_cooldown_rows(conn, namespace, now):
+        occupants.append({**dict(row), "source": SOURCE_RELEASED})
+    return occupants
+
+
+def _occupant_conflicts(
+    normalized_name: str,
+    occupants: list[dict],
+    confusable_cache: dict[tuple[str, str], bool],
+    occupant_conflict_cache: dict[str, list[dict]],
+) -> list[dict]:
+    """候选规范名与既有占用集合的逐条冲突（结构与 find_conflicts 完全一致）。
+
+    两层缓存均仅限单次请求：is_confusable 按无序规范名对缓存（候选两两之间
+    及候选与既有占用之间的同形判定不重复计算）；相同候选规范名（如不同
+    申请项携带同一候选名）的完整既有冲突明细也直接复用——各记录 id /
+    source 不随候选位置变化。
+    """
+    cached = occupant_conflict_cache.get(normalized_name)
+    if cached is not None:
+        return cached
+    conflicts: list[dict] = []
+    for occupant in occupants:
+        existing_normalized = occupant["normalized_name"]
+        if existing_normalized == normalized_name:
+            reason = REASON_NORMALIZED_MATCH
+        else:
+            cache_key = tuple(sorted((normalized_name, existing_normalized)))
+            hit = confusable_cache.get(cache_key)
+            if hit is None:
+                hit = is_confusable(normalized_name, existing_normalized)
+                confusable_cache[cache_key] = hit
+            if not hit:
+                continue
+            reason = REASON_CONFUSABLE
+        conflicts.append(_conflict_entry(occupant, occupant["source"], reason))
+    occupant_conflict_cache[normalized_name] = conflicts
+    return conflicts
+
+
+def _candidate_specs_against_state(
+    items: list[dict],
+    pairs,
+    occupants: list[dict],
+    confusable_cache: dict[tuple[str, str], bool],
+    occupant_conflict_cache: dict[str, list[dict]],
+) -> list[list[CandidateSpec]]:
+    """在写事务快照上为每个申请项的每个候选产出静态判定 CandidateSpec。
+
+    静态约束与单条注册完全一致：先按所属命名空间生效策略判定混脚本，再与
+    全部既有占用（已注册名称 / 有效预占 / 未过期冷却）做规范名相等 / 同形
+    判定；任一不通过即 valid=False，reasons 给出全部命中原因（混脚本一项 +
+    逐条既有冲突）。
+    """
+    grouped: list[list[CandidateSpec]] = []
+    for item_index, item in enumerate(items):
+        specs: list[CandidateSpec] = []
+        for candidate_index, name in enumerate(item["candidates"]):
+            normalized = normalize_name(name)
+            script_analysis = analyze_scripts(name, pairs)
+            reasons: list[dict] = []
+            if script_analysis["mixed_script_violation"]:
+                reasons.append(
+                    {
+                        "reason": "mixed_script",
+                        "restricted_scripts_used": script_analysis[
+                            "restricted_scripts_used"
+                        ],
+                        "blocked_script_pairs": script_analysis["blocked_script_pairs"],
+                        "violating_script_pairs": script_analysis[
+                            "violating_script_pairs"
+                        ],
+                        "script_details": script_analysis["script_details"],
+                    }
+                )
+            reasons.extend(
+                _occupant_conflicts(
+                    normalized,
+                    occupants,
+                    confusable_cache,
+                    occupant_conflict_cache,
+                )
+            )
+            specs.append(
+                CandidateSpec(
+                    item_index=item_index,
+                    candidate_index=candidate_index,
+                    client_id=item["client_id"],
+                    original_name=name,
+                    normalized_name=normalized,
+                    valid=not reasons,
+                    reasons=tuple(reasons),
+                )
+            )
+        grouped.append(specs)
+    return grouped
+
+
+def _positions_conflict(left: CandidateSpec, right: CandidateSpec, cache) -> str | None:
+    """两个不同申请项的候选之间是否冲突；返回原因或 None。
+
+    规则与既有名称间冲突一致：规范名相等为 normalized_match，否则按
+    无序规范名对缓存的 confusables 同形判定为 confusable。
+    """
+    if left.normalized_name == right.normalized_name:
+        return REASON_NORMALIZED_MATCH
+    cache_key = tuple(sorted((left.normalized_name, right.normalized_name)))
+    hit = cache.get(cache_key)
+    if hit is None:
+        hit = is_confusable(left.normalized_name, right.normalized_name)
+        cache[cache_key] = hit
+    return REASON_CONFUSABLE if hit else None
+
+
+def _build_allocation_model(
+    items: list[dict],
+    grouped: list[list[CandidateSpec]],
+    confusable_cache: dict[tuple[str, str], bool] | None = None,
+) -> AllocationModel:
+    """由静态判定结果构建位掩码约束模型：有效候选位 + 项间冲突位掩码。
+
+    复用静态判定阶段的 confusables 无序规范名对缓存，避免重复同形计算。
+    """
+    width = MAX_CANDIDATES_PER_ITEM
+    valid_positions: list[int] = []
+    for specs in grouped:
+        mask = 0
+        for spec in specs:
+            if spec.valid:
+                mask |= 1 << spec.candidate_index
+        valid_positions.append(mask)
+
+    model = AllocationModel(
+        items=items,
+        candidates=grouped,
+        valid_positions=valid_positions,
+        conflict_masks={},
+    )
+    cache: dict[tuple[str, str], bool] = (
+        confusable_cache if confusable_cache is not None else {}
+    )
+    for i, left_specs in enumerate(grouped):
+        for left_spec in left_specs:
+            mask = 0
+            # 静态无效候选不会被搜索选中，其禁用位掩码用不到（409 明细也只
+            # 导出指向静态有效候选的冲突）；跳过可避免一半以上的同形判定。
+            if not left_spec.valid:
+                model.conflict_masks[(i, left_spec.candidate_index)] = mask
+                continue
+            for j, right_specs in enumerate(grouped):
+                if j == i:
+                    continue
+                for right_spec in right_specs:
+                    if not right_spec.valid:
+                        continue
+                    if _positions_conflict(left_spec, right_spec, cache):
+                        mask |= 1 << (j * width + right_spec.candidate_index)
+            model.conflict_masks[(i, left_spec.candidate_index)] = mask
+    return model
+
+
+def _candidate_blocker_entry(spec: CandidateSpec, model: AllocationModel) -> dict:
+    """组装 409 明细中的逐候选阻断原因载荷。
+
+    静态阻断原因（混脚本 / 与既有占用冲突）始终给出；并附该候选与请求中
+    其他项**静态有效**候选的项间冲突（candidate_conflicts，按
+    (项索引, 候选索引, 原因) 升序，直接由搜索模型的冲突位掩码导出）。
+    与静态无效候选的冲突不列出——该候选自身已在其所属项下带静态原因，
+    且永不会被选中，不构成真实约束。
+    """
+    entry = {
+        "candidate_index": spec.candidate_index,
+        "original_name": spec.original_name,
+        "normalized_name": spec.normalized_name,
+        "reasons": [dict(reason) for reason in spec.reasons],
+    }
+    width = MAX_CANDIDATES_PER_ITEM
+    mask = model.conflict_masks[(spec.item_index, spec.candidate_index)]
+    request_conflicts: list[dict] = []
+    for other_index, other_specs in enumerate(model.candidates):
+        if other_index == spec.item_index:
+            continue
+        for other_spec in other_specs:
+            bit = 1 << (other_index * width + other_spec.candidate_index)
+            if not (mask & bit) or not other_spec.valid:
+                continue
+            reason = (
+                REASON_NORMALIZED_MATCH
+                if spec.normalized_name == other_spec.normalized_name
+                else REASON_CONFUSABLE
+            )
+            request_conflicts.append(
+                {
+                    "item_index": other_index,
+                    "client_id": other_spec.client_id,
+                    "candidate_index": other_spec.candidate_index,
+                    "original_name": other_spec.original_name,
+                    "normalized_name": other_spec.normalized_name,
+                    "reason": reason,
+                }
+            )
+    request_conflicts.sort(
+        key=lambda conflict: (
+            conflict["item_index"],
+            conflict["candidate_index"],
+            conflict["reason"],
+        )
+    )
+    entry["candidate_conflicts"] = request_conflicts
+    return entry
+
+
+def _impossible_items(model: AllocationModel) -> list[dict]:
+    """无解时组装“无可选项”的申请项明细（409 allocation_impossible）。
+
+    列出**根因项**：每个候选都被静态约束（脚本 / 规范名 / 同形）或与请求
+    中其他项某个静态有效候选的两两冲突直接阻断的申请项——其任意选择都
+    无法避开一个具体的、已列出的阻断原因。已证明整体无解时本集合必非空
+    （若每项都至少有一个静态有效且与其他项任何候选都不冲突的候选，这些
+    候选合起来即构成完整解，与无解矛盾）。极端争用结构下若根因项集合
+    意外为空（防御性分支），回退为按请求顺序列出全部申请项，逐候选给出
+    静态原因与项间冲突，供客户端整体调整后重试。
+    """
+    root_items: list[dict] = []
+    for item_index, specs in enumerate(model.candidates):
+        candidates = [
+            blocker
+            for spec in specs
+            if (
+                blocker := _candidate_blocker_entry(spec, model)
+            )["reasons"]
+            or blocker["candidate_conflicts"]
+        ]
+        if len(candidates) == len(specs):
+            root_items.append(
+                {
+                    "index": item_index,
+                    "client_id": model.items[item_index]["client_id"],
+                    "candidates": candidates,
+                }
+            )
+
+    if root_items:
+        return root_items
+
+    # 防御性回退：理论上不可达（见函数说明），仍保证 409 明细完整
+    return [
+        {
+            "index": item_index,
+            "client_id": model.items[item_index]["client_id"],
+            "candidates": [
+                _candidate_blocker_entry(spec, model)
+                for spec in model.candidates[item_index]
+            ],
+        }
+        for item_index in range(len(model.items))
+    ]
+
+
+def allocate_names(
+    conn: sqlite3.Connection, namespace: str, items: list[dict]
+) -> dict:
+    """候选集原子注册：单个 BEGIN IMMEDIATE 事务内求解并一次性注册。
+
+    items 为 [{"client_id": ..., "candidates": [name, ...]}]，长度 1–20，
+    每项 1–10 个按优先级排列的候选名（client_id 唯一性由 Pydantic 保证）。
+
+    事务流程（任何失败都整体回滚，绝不写入部分结果）：
+    1. BEGIN IMMEDIATE 取库级写锁，惰性清理过期预占与释放冷却；
+    2. 重新加载命名空间生效脚本策略（与注册 / 批量 / 预占一致，防止只读
+       分析后策略被并发改严），对每个候选做静态判定（混脚本 -> 原因里带
+       脚本明细；规范名 / 同形 -> 带既有占用冲突明细，覆盖已注册名称、
+       有效预占与未过期冷却）；
+    3. 预计算项间冲突（不同项选中规范名相等 / 同形即冲突），以位掩码回溯
+       搜索字典序最小的完整分配；搜索状态超过 10000 ->
+       AllocationSearchTooLargeError（-> 413，事务回滚，不写库）；
+    4. 不存在可行组合 -> AllocationImpossibleError（-> 409，附无可选项与
+       逐候选阻断原因，事务回滚，不写库）；
+    5. 找到解后在同一事务一次性 INSERT 全部已注册名称，返回与请求顺序
+       一致的逐项记录（含 client_id 与实际选中的 candidate_index）。
+    """
+    moment = utc_now()
+    grouped: list[list[CandidateSpec]] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
+        # 事务内持锁加载生效策略与既有占用快照：持写锁期间状态不会被并发改写
+        pairs = get_blocked_pairs(conn, namespace)
+        occupants = _existing_occupants(conn, namespace, moment)
+        confusable_cache: dict[tuple[str, str], bool] = {}
+        occupant_conflict_cache: dict[str, list[dict]] = {}
+        grouped = _candidate_specs_against_state(
+            items,
+            pairs,
+            occupants,
+            confusable_cache,
+            occupant_conflict_cache,
+        )
+        model = _build_allocation_model(items, grouped, confusable_cache)
+        solution = model.solve()
+        if solution is None:
+            raise AllocationImpossibleError(
+                _impossible_items(model), model.visited_states
+            )
+        records: list[dict] = []
+        for item_index, candidate_index in enumerate(solution):
+            spec = grouped[item_index][candidate_index]
+            cursor = conn.execute(
+                """
+                INSERT INTO display_names (namespace, original_name, normalized_name)
+                VALUES (?, ?, ?)
+                """,
+                (namespace, spec.original_name, spec.normalized_name),
+            )
+            records.append((cursor.lastrowid, item_index, candidate_index))
+        conn.commit()
+    except (AllocationImpossibleError, AllocationSearchTooLargeError):
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 锁竞争 / 唯一约束兜底（持写锁后理论上不会发生）：整体回滚
+        conn.rollback()
+        raise NameConflictError(str(exc)) from exc
+
+    result_items: list[dict] = []
+    for new_id, item_index, candidate_index in records:
+        row = conn.execute(
+            "SELECT * FROM display_names WHERE id = ?", (new_id,)
+        ).fetchone()
+        result_items.append(
+            {
+                "index": item_index,
+                "client_id": items[item_index]["client_id"],
+                "candidate_index": candidate_index,
+                **dict(row),
+            }
+        )
+    return {"namespace": namespace, "items": result_items}

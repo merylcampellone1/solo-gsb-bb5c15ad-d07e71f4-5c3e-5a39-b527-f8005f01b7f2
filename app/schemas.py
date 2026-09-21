@@ -559,3 +559,78 @@ class SnapshotProofResponse(BaseModel):
 class ErrorDetail(BaseModel):
     error: str
     message: str
+
+
+# ---------- 候选集原子注册（POST .../names/allocate） ----------
+
+# client_id 约束：1–128 字符、非空白（仅要求在一次请求内唯一）
+ClientIdStr = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=128),
+    AfterValidator(_not_blank),
+]
+
+# 申请项 / 候选数量边界（与 app.allocation 中的常量保持一致）
+MIN_ALLOCATION_ITEMS = 1
+MAX_ALLOCATION_ITEMS = 20
+MIN_ALLOCATION_CANDIDATES = 1
+MAX_ALLOCATION_CANDIDATES = 10
+
+
+class AllocationItemRequest(BaseModel):
+    """候选集原子注册中的一个申请项：唯一 client_id + 按优先级排列的候选名。"""
+
+    client_id: ClientIdStr = Field(
+        examples=["client-001"],
+        description="申请项在本次请求内的唯一标识；响应按该标识与请求索引回显",
+    )
+    candidates: list[NameStr] = Field(
+        min_length=MIN_ALLOCATION_CANDIDATES,
+        max_length=MAX_ALLOCATION_CANDIDATES,
+        examples=[["alice", "alice-01", "аlice"]],
+        description=(
+            "按优先级排列的 1–10 个候选显示名；candidate_index 从 0 开始，"
+            "存在多组可行组合时按各项选中序号向量的字典序取最小解"
+        ),
+    )
+
+
+class AllocationRequest(BaseModel):
+    """候选集原子注册请求体：1–20 个申请项，client_id 在请求内互不相同。"""
+
+    items: list[AllocationItemRequest] = Field(
+        min_length=MIN_ALLOCATION_ITEMS,
+        max_length=MAX_ALLOCATION_ITEMS,
+        description=(
+            "1–20 个申请项；client_id 必须在请求内互不相同。"
+            "全部申请项在单个 BEGIN IMMEDIATE 事务内统一求解，"
+            "要么一次性全部注册，要么不写入任何记录"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_client_ids(self) -> "AllocationRequest":
+        client_ids = [item.client_id for item in self.items]
+        if len(set(client_ids)) != len(client_ids):
+            raise ValueError("items 中的 client_id 必须互不相同")
+        return self
+
+
+class AllocationItemRecord(NameRecord):
+    """候选集原子注册成功的单项记录：落库字段 + client_id + 实际中选候选序号。"""
+
+    index: int = Field(description="申请项在请求中的下标（从 0 开始）")
+    client_id: str = Field(description="申请项携带的唯一 client_id")
+    candidate_index: int = Field(
+        description=(
+            "实际注册的候选在该申请项 candidates 中的序号（从 0 开始）；"
+            "整体解为各项中选序号向量的字典序最小解"
+        )
+    )
+
+
+class AllocationResponse(BaseModel):
+    """候选集原子注册成功响应：items 按请求顺序返回，注册在同一事务一次性完成。"""
+
+    namespace: str
+    items: list[AllocationItemRecord]
