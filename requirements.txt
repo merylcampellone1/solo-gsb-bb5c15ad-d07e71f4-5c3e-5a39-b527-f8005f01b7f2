@@ -1,0 +1,5 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+confusables>=1.2.0
+unicodedataplus>=15.1.0
+pydantic>=2.7

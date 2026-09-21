@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: unicode-name-guard:latest
+    # 镜像 CMD 已在 API 启动前执行 python -m app.database migrate（迁移失败则容器退出）
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/names.db
+    volumes:
+      - names-data:/data
+    restart: unless-stopped
+
+volumes:
+  names-data:
